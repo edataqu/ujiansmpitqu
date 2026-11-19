@@ -4,6 +4,7 @@
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
     <title>CBT Futuristik</title>
+
     <!-- PWA Meta Tags (Android, Chrome, Edge, & iOS Safari) -->
     <meta name="description" content="Aplikasi Ujian Berbasis Komputer (CBT Futuristik) untuk jenjang Kelas 1 sampai 12.">
     <meta name="theme-color" content="#16a34a">
@@ -188,6 +189,8 @@
 
         // Daftar Kelas Lengkap: Kelas 1 sampai 12 (SD, SMP, SMA/SMK)
         const ALL_CLASSES = ['1', '2', '3', '4', '5', '6', '7', '8', '9', '10', '11', '12'];
+        const ACTIVE_SESSION_KEY = 'cbt_active_exam_session_v1';
+        const PENDING_SUBMISSIONS_KEY = 'cbt_pending_submissions_v1';
 
         // Helper Storage Aman (Anti-Crash pada Mode Incognito / Storage Penuh)
         const safeStorage = {
@@ -335,6 +338,15 @@
           const [isPwaInstalled, setIsPwaInstalled] = useState(false);
           const [showPwaGuideModal, setShowPwaGuideModal] = useState(false);
 
+          // State Auto-Save Sesi & Pengiriman Database Terjamin
+          const [lastSavedTime, setLastSavedTime] = useState('');
+          const [submitStatus, setSubmitStatus] = useState('idle'); // 'idle' | 'sending' | 'success' | 'failed'
+          const [submitErrorMsg, setSubmitErrorMsg] = useState('');
+          const [lastSubmissionId, setLastSubmissionId] = useState(null);
+          const [pendingCount, setPendingCount] = useState(0);
+          const [isSyncingPending, setIsSyncingPending] = useState(false);
+          const hasRestoredSessionRef = useRef(false);
+
           // Sistem Notifikasi & Konfirmasi Kustom (Pengganti alert() & confirm() agar stabil di PWA)
           const [toast, setToast] = useState(null);
           const [confirmModal, setConfirmModal] = useState({ open: false, title: '', message: '', onConfirm: null });
@@ -433,12 +445,131 @@
 
           const availableSubjects = currentUser?.role === 'guru' ? schoolProfile.subjects : [];
 
+          // --- HELPER AUTO-SAVE SESI & ANTRIAN PENGIRIMAN DATABASE ---
+          const getPendingQueue = () => {
+              try {
+                  const raw = safeStorage.get(PENDING_SUBMISSIONS_KEY, '[]');
+                  const parsed = JSON.parse(raw);
+                  return Array.isArray(parsed) ? parsed : [];
+              } catch (e) { return []; }
+          };
+
+          const setPendingQueue = (queue) => {
+              safeStorage.set(PENDING_SUBMISSIONS_KEY, JSON.stringify(queue));
+              setPendingCount(queue.length);
+          };
+
+          const clearActiveExamSession = () => {
+              safeStorage.remove(ACTIVE_SESSION_KEY);
+          };
+
+          const saveActiveExamSession = (sessionOverride = {}) => {
+              const userObj = sessionOverride.currentUser || currentUser;
+              const subj = sessionOverride.activeSubject || activeSubject;
+              const qList = sessionOverride.examQuestions || examQuestions;
+              if (!userObj || !subj || !qList || qList.length === 0) return;
+
+              const payload = {
+                  currentUser: userObj,
+                  activeSubject: subj,
+                  subjectJenis: sessionOverride.subjectJenis || examConfig[subj]?.jenis || 'THB',
+                  examQuestions: qList,
+                  studentAnswers: sessionOverride.studentAnswers !== undefined ? sessionOverride.studentAnswers : studentAnswers,
+                  currentQIndex: sessionOverride.currentQIndex !== undefined ? sessionOverride.currentQIndex : currentQIndex,
+                  timeLeft: sessionOverride.timeLeft !== undefined ? sessionOverride.timeLeft : timeLeft,
+                  cheatCount: sessionOverride.cheatCount !== undefined ? sessionOverride.cheatCount : cheatCount,
+                  savedAt: Date.now()
+              };
+              safeStorage.set(ACTIVE_SESSION_KEY, JSON.stringify(payload));
+              const now = new Date();
+              setLastSavedTime(now.toLocaleTimeString('id-ID', { hour: '2-digit', minute: '2-digit', second: '2-digit' }));
+          };
+
+          const sendResultToServerDirect = async (resultPayload, isDemoUser = false) => {
+              if (isDemoUser) {
+                  await new Promise(res => setTimeout(res, 600));
+                  return { status: 'success' };
+              }
+              const controller = new AbortController();
+              const timeoutId = setTimeout(() => controller.abort(), 25000);
+              try {
+                  const res = await fetch(scriptUrl, {
+                      method: 'POST',
+                      body: JSON.stringify({ action: 'save_result', result: resultPayload }),
+                      signal: controller.signal
+                  });
+                  clearTimeout(timeoutId);
+                  const text = await res.text();
+                  let data;
+                  try { data = JSON.parse(text); } catch (e) {
+                      throw new Error('Respon server tidak valid.');
+                  }
+                  if (data.status === 'error') throw new Error(data.message || 'Server menolak data.');
+                  return data;
+              } catch (err) {
+                  clearTimeout(timeoutId);
+                  if (err.name === 'AbortError') throw new Error('Waktu koneksi habis (Timeout).');
+                  throw err;
+              }
+          };
+
+          const syncPendingSubmissions = async (silent = false) => {
+              const queue = getPendingQueue();
+              setPendingCount(queue.length);
+              if (queue.length === 0 || isSyncingPending) return;
+
+              setIsSyncingPending(true);
+              if (!silent) setSubmitStatus('sending');
+              const remaining = [];
+              let syncedAny = false;
+
+              for (const item of queue) {
+                  try {
+                      await sendResultToServerDirect(item.result, item.isDemo);
+                      syncedAny = true;
+                      if (item.id === lastSubmissionId) {
+                          setSubmitStatus('success');
+                          setSubmitErrorMsg('');
+                      }
+                  } catch (err) {
+                      remaining.push(item);
+                      if (item.id === lastSubmissionId) {
+                          setSubmitStatus('failed');
+                          setSubmitErrorMsg(err.message || 'Gagal terhubung ke server.');
+                      }
+                  }
+              }
+
+              setPendingQueue(remaining);
+              setIsSyncingPending(false);
+
+              if (syncedAny) {
+                  fetchSystemData();
+                  if (!silent || remaining.length === 0) {
+                      showToast('Semua hasil ujian berhasil disinkronkan ke database!', 'success');
+                  }
+              } else if (!silent && remaining.length > 0) {
+                  showToast('Masih gagal mengirim ke database. Periksa koneksi internet lalu coba lagi.', 'error');
+              }
+          };
+
           // DETEKSI ONLINE/OFFLINE & EVENT INSTALL PWA
           useEffect(() => {
-            const handleOnline = () => { setIsOnline(true); showToast('Koneksi internet kembali terhubung.', 'success'); };
-            const handleOffline = () => { setIsOnline(false); showToast('Koneksi internet terputus! Jawaban Anda tetap tersimpan di perangkat.', 'warning'); };
+            const handleOnline = () => {
+                setIsOnline(true);
+                showToast('Koneksi internet kembali terhubung. Menyinkronkan data...', 'success');
+                syncPendingSubmissions(true);
+            };
+            const handleOffline = () => { setIsOnline(false); showToast('Koneksi internet terputus! Jawaban Anda tetap tersimpan otomatis di perangkat.', 'warning'); };
             window.addEventListener('online', handleOnline);
             window.addEventListener('offline', handleOffline);
+
+            // Cek antrian pengiriman yang belum terkirim saat aplikasi dibuka
+            const existingQueue = getPendingQueue();
+            setPendingCount(existingQueue.length);
+            if (existingQueue.length > 0 && navigator.onLine) {
+                syncPendingSubmissions(true);
+            }
 
             const isStandalone = window.matchMedia('(display-mode: standalone)').matches || window.navigator.standalone === true;
             if (isStandalone) setIsPwaInstalled(true);
@@ -572,6 +703,36 @@
 
           useEffect(() => { fetchSystemData(); }, [scriptUrl]);
 
+          // PEMULIHAN OTOMATIS SESI UJIAN JIKA SISWA ME-REFRESH HALAMAN
+          useEffect(() => {
+            if (!isSystemReady || hasRestoredSessionRef.current) return;
+            hasRestoredSessionRef.current = true;
+            try {
+              const savedSessionStr = safeStorage.get(ACTIVE_SESSION_KEY, '');
+              if (!savedSessionStr) return;
+              const session = JSON.parse(savedSessionStr);
+              if (session && session.currentUser && session.activeSubject && Array.isArray(session.examQuestions) && session.examQuestions.length > 0) {
+                setCurrentUser(session.currentUser);
+                setActiveSubject(session.activeSubject);
+                setExamQuestions(session.examQuestions);
+                setStudentAnswers(session.studentAnswers || {});
+                setCurrentQIndex(Math.min(session.currentQIndex || 0, session.examQuestions.length - 1));
+                setTimeLeft(typeof session.timeLeft === 'number' && session.timeLeft > 0 ? session.timeLeft : 60);
+                setCheatCount(session.cheatCount || 0);
+                setView('exam');
+                showToast(`Sesi ujian ${session.activeSubject} dipulihkan otomatis! Silakan lanjutkan tes.`, 'success');
+              }
+            } catch (err) {
+              console.warn('Gagal memulihkan sesi ujian:', err);
+            }
+          }, [isSystemReady]);
+
+          // AUTO-SAVE SESI UJIAN SETIAP KALI JAWABAN, NOMOR SOAL, ATAU WAKTU BERUBAH
+          useEffect(() => {
+            if (view !== 'exam' || !currentUser || !activeSubject || examQuestions.length === 0) return;
+            saveActiveExamSession();
+          }, [view, studentAnswers, currentQIndex, timeLeft, cheatCount]);
+
           useEffect(() => {
             if (schoolProfile.subjects.length > 0 && !selectedSubject) setSelectedSubject(schoolProfile.subjects[0]);
             setTempMapel(schoolProfile.subjects.join(', '));
@@ -701,6 +862,7 @@
 
           const handleLogout = () => { 
               if (document.fullscreenElement) document.exitFullscreen().catch(()=>{});
+              clearActiveExamSession();
               setCurrentUser(null); setView('login'); setActiveSubject(null); setExamModalOpen(false); 
               setExamResultDetails(null);
           };
@@ -1343,13 +1505,30 @@
               else { setStudentAnswers({}); }
 
               const savedTimeStr = safeStorage.get(savedTimeKey, '');
+              let initialTimeLeft = (config.duration || 60) * 60;
               if (savedTimeStr && !isNaN(parseInt(savedTimeStr, 10)) && parseInt(savedTimeStr, 10) > 0) {
-                  setTimeLeft(parseInt(savedTimeStr, 10));
-              } else {
-                  setTimeLeft((config.duration || 60) * 60);
+                  initialTimeLeft = parseInt(savedTimeStr, 10);
               }
+              setTimeLeft(initialTimeLeft);
               
               setCurrentQIndex(0);
+              setSubmitStatus('idle');
+              setSubmitErrorMsg('');
+
+              // Simpan sesi ujian langsung ke perangkat agar aman jika di-refresh kapan saja
+              let initialAnswers = {};
+              if (savedAnswersStr) { try { initialAnswers = JSON.parse(savedAnswersStr); } catch(e) { initialAnswers = {}; } }
+              saveActiveExamSession({
+                  currentUser,
+                  activeSubject,
+                  subjectJenis,
+                  examQuestions: finalQuestions,
+                  studentAnswers: initialAnswers,
+                  currentQIndex: 0,
+                  timeLeft: initialTimeLeft,
+                  cheatCount: 0
+              });
+
               setExamModalOpen(false); setView('exam');
 
               const docElm = document.documentElement;
@@ -1361,7 +1540,12 @@
           const submitLogic = async () => {
             if (!examQuestions || examQuestions.length === 0) return;
             let correct = 0;
-            examQuestions.forEach(q => { if (studentAnswers[q._id] === q.answer) correct++; });
+            const detailJawaban = examQuestions.map((q, idx) => {
+                const chosen = studentAnswers[q._id] || '-';
+                if (chosen === q.answer) correct++;
+                return `${idx + 1}:${chosen}`;
+            }).join(',');
+
             const finalScore = Math.round((correct / examQuestions.length) * 100);
             const wrong = examQuestions.length - correct;
 
@@ -1373,36 +1557,77 @@
                 questions: examQuestions,
                 answers: studentAnswers
             });
-            
+
+            const subjectJenis = examConfig[activeSubject]?.jenis || 'THB';
+            const currentToken = examConfig[activeSubject]?.token || '';
+            const mapelToSave = subjectJenis === 'UAS' ? `${activeSubject} (UAS)` : activeSubject;
+
+            const resultPayload = {
+                nama: currentUser.name,
+                nisn: currentUser.nisn,
+                nis: currentUser.nis,
+                kelas: currentUser.kelas,
+                mapel: mapelToSave,
+                nilai: finalScore,
+                token: currentToken,
+                benar: correct,
+                salah: wrong,
+                totalSoal: examQuestions.length,
+                jawaban: detailJawaban
+            };
+
+            const submissionId = `${currentUser.nisn}_${mapelToSave}_${Date.now()}`;
+            setLastSubmissionId(submissionId);
+            setSubmitStatus('sending');
+            setSubmitErrorMsg('');
+
+            // 1. Amankan data ke antrian lokal terlebih dahulu (anti-hilang jika browser tertutup/refresh)
+            const currentQueue = getPendingQueue();
+            currentQueue.push({ id: submissionId, result: resultPayload, isDemo: !!currentUser?.isDemo, createdAt: Date.now() });
+            setPendingQueue(currentQueue);
+
+            // 2. Bersihkan sesi ujian aktif karena siswa sudah mengumpulkan tes
+            clearActiveExamSession();
+            safeStorage.remove(`exam_progress_${currentUser.nisn}_${activeSubject}_${subjectJenis}`);
+            safeStorage.remove(`exam_time_${currentUser.nisn}_${activeSubject}_${subjectJenis}`);
+            safeStorage.remove(`exam_order_${currentUser.nisn}_${activeSubject}_${subjectJenis}`);
+
             // Masuk ke Mode Loading (Animasi 5 detik)
             setView('calculating');
             setCountdown(5);
 
-            try {
-              const subjectJenis = examConfig[activeSubject]?.jenis || 'THB';
-              const currentToken = examConfig[activeSubject]?.token || '';
-              const mapelToSave = subjectJenis === 'UAS' ? `${activeSubject} (UAS)` : activeSubject;
-
-              // Fitur Retry (Kirim 3 Kali Jika Gagal Jaringan)
-              let attempts = 3;
-              let isSaved = false;
-              
-              while(attempts > 0 && !isSaved) {
-                  try {
-                      await apiCall({ action: 'save_result', result: { nama: currentUser.name, nisn: currentUser.nisn, nis: currentUser.nis, kelas: currentUser.kelas, mapel: mapelToSave, nilai: finalScore, token: currentToken }});
-                      isSaved = true;
-                      safeStorage.remove(`exam_progress_${currentUser.nisn}_${activeSubject}_${subjectJenis}`);
-                      safeStorage.remove(`exam_time_${currentUser.nisn}_${activeSubject}_${subjectJenis}`);
-                      safeStorage.remove(`exam_order_${currentUser.nisn}_${activeSubject}_${subjectJenis}`);
-                  } catch (e) {
-                      attempts--;
-                      console.error("Gagal simpan nilai, mencoba ulang...", e);
-                      await new Promise(r => setTimeout(r, 1500));
-                  }
-              }
-            } catch (e) { console.error("Gagal memproses nilai", e); }
-
             if (document.fullscreenElement) document.exitFullscreen().catch(()=>{});
+
+            // 3. Pengiriman Terjamin ke Database dengan 5x Auto-Retry + Jeda Bertahap
+            let attempts = 5;
+            let isSaved = false;
+            let lastErr = '';
+
+            for (let attempt = 1; attempt <= attempts; attempt++) {
+                try {
+                    await sendResultToServerDirect(resultPayload, !!currentUser?.isDemo);
+                    isSaved = true;
+                    break;
+                } catch (e) {
+                    lastErr = e.message || 'Gangguan koneksi jaringan.';
+                    console.error(`Percobaan kirim ke-${attempt} gagal:`, e);
+                    if (attempt < attempts) {
+                        await new Promise(r => setTimeout(r, attempt * 1500));
+                    }
+                }
+            }
+
+            if (isSaved) {
+                const updatedQueue = getPendingQueue().filter(item => item.id !== submissionId);
+                setPendingQueue(updatedQueue);
+                setSubmitStatus('success');
+                setSubmitErrorMsg('');
+                fetchSystemData();
+            } else {
+                setSubmitStatus('failed');
+                setSubmitErrorMsg(lastErr);
+                showToast('Pengiriman ke database tertunda karena jaringan. Gunakan tombol Kirim Ulang di layar hasil.', 'warning');
+            }
           };
 
           const forceSubmitExam = async () => { await submitLogic(); };
@@ -1420,7 +1645,20 @@
             <>
               {!isOnline && (
                 <div className="fixed bottom-4 left-1/2 -translate-x-1/2 z-[120] bg-amber-600 text-white px-5 py-2.5 rounded-full shadow-2xl font-bold text-xs md:text-sm flex items-center gap-2 animate-bounce">
-                  <Icon name="wifi" /> Mode Offline — Pastikan internet aktif saat mengirim ujian
+                  <Icon name="wifi" /> Mode Offline — Jawaban tersimpan otomatis di perangkat
+                </div>
+              )}
+
+              {pendingCount > 0 && view !== 'exam' && view !== 'calculating' && view !== 'result' && (
+                <div className="fixed bottom-4 right-4 z-[115] bg-amber-50 border-2 border-amber-400 text-amber-900 px-4 py-3 rounded-2xl shadow-2xl flex items-center gap-3 max-w-sm">
+                  <Icon name="cloud-arrow-up" className={`text-xl text-amber-600 ${isSyncingPending ? 'animate-bounce' : ''}`} />
+                  <div className="text-xs flex-1">
+                    <p className="font-black">{pendingCount} Hasil Ujian Belum Terkirim</p>
+                    <p className="text-amber-700">Tersimpan aman di perangkat.</p>
+                  </div>
+                  <button onClick={() => syncPendingSubmissions(false)} disabled={isSyncingPending} className="px-3 py-1.5 bg-amber-500 hover:bg-amber-600 text-white font-black rounded-lg text-xs shadow-sm shrink-0">
+                    {isSyncingPending ? 'Mengirim...' : 'Kirim'}
+                  </button>
                 </div>
               )}
 
@@ -2201,7 +2439,12 @@
                     <div className="w-10 h-10 md:w-12 md:h-12 bg-gradient-to-br from-yellow-300 to-green-400 rounded-xl flex items-center justify-center text-white font-black shadow-md text-sm border border-yellow-300/50 shrink-0 drop-shadow">CBT</div>
                     <div className="truncate">
                       <h2 className="text-sm md:text-lg font-black text-gray-800 truncate drop-shadow-sm">{activeSubject} {examConfig[activeSubject]?.jenis === 'UAS' ? '(UAS)' : ''}</h2>
-                      <p className="text-gray-600 text-[10px] md:text-xs font-mono font-bold truncate">{currentUser?.name}</p>
+                      <div className="flex items-center gap-2">
+                        <p className="text-gray-600 text-[10px] md:text-xs font-mono font-bold truncate">{currentUser?.name}</p>
+                        <span className="inline-flex items-center gap-1 text-[10px] font-bold text-green-700 bg-green-100 border border-green-300 px-2 py-0.5 rounded-full shrink-0" title={lastSavedTime ? `Terakhir disimpan: ${lastSavedTime}` : 'Auto-Save Aktif'}>
+                          <Icon name="cloud-check" className="text-[9px]" /> Auto-Save
+                        </span>
+                      </div>
                     </div>
                   </div>
                   <div className={`flex items-center gap-2 px-4 py-2 md:px-6 md:py-2.5 rounded-xl border-2 shrink-0 backdrop-blur-sm shadow-sm ${timeLeft < 300 ? 'border-red-400 bg-red-100/90 text-red-700 animate-pulse' : 'border-green-400 bg-green-50/90 text-green-800'}`}>
@@ -2326,6 +2569,35 @@
                       <Icon name="circle-check" className="text-6xl md:text-7xl text-green-500 mb-4 mx-auto drop-shadow-lg" />
                       <h2 className="text-3xl md:text-4xl font-black text-gray-800 tracking-tight drop-shadow-sm">UJIAN SELESAI</h2>
                       <p className="text-green-600 font-black mt-2 text-sm md:text-base uppercase tracking-widest bg-green-100 px-4 py-1.5 rounded-full inline-block border border-green-300">{activeSubject} {examConfig[activeSubject]?.jenis === 'UAS' ? '(UAS)' : ''}</p>
+                  </div>
+
+                  {/* STATUS PENGIRIMAN KE DATABASE (TRANSPARAN & TERJAMIN) */}
+                  <div className="mb-6">
+                    {submitStatus === 'sending' && (
+                      <div className="bg-blue-50 border-2 border-blue-300 text-blue-800 rounded-2xl p-4 flex items-center justify-center gap-3 font-bold text-xs md:text-sm shadow-sm">
+                        <Icon name="spinner" className="fa-spin text-lg text-blue-600" />
+                        <span>Sedang mengirim nilai & jawaban ke database server...</span>
+                      </div>
+                    )}
+                    {submitStatus === 'success' && (
+                      <div className="bg-green-50 border-2 border-green-400 text-green-800 rounded-2xl p-4 flex items-center justify-center gap-3 font-bold text-xs md:text-sm shadow-sm">
+                        <Icon name="database" className="text-lg text-green-600" />
+                        <span>TERKIRIM KE DATABASE — Nilai & jawaban Anda telah tercatat dengan aman di sistem.</span>
+                      </div>
+                    )}
+                    {submitStatus === 'failed' && (
+                      <div className="bg-red-50 border-2 border-red-400 text-red-800 rounded-2xl p-4 text-center shadow-sm">
+                        <div className="flex items-center justify-center gap-2 font-black text-xs md:text-sm mb-2">
+                          <Icon name="triangle-exclamation" className="text-lg text-red-600" />
+                          <span>BELUM TERKIRIM KE DATABASE ({submitErrorMsg || 'Gangguan Jaringan'})</span>
+                        </div>
+                        <p className="text-xs text-red-700 mb-3">Jangan khawatir, nilai & jawaban Anda tersimpan aman di perangkat ini. Pastikan internet aktif lalu klik tombol di bawah:</p>
+                        <button onClick={() => syncPendingSubmissions(false)} disabled={isSyncingPending} className="px-5 py-2.5 bg-red-600 hover:bg-red-700 text-white font-black rounded-xl text-xs md:text-sm shadow-md inline-flex items-center gap-2">
+                          <Icon name={isSyncingPending ? 'spinner' : 'rotate-right'} className={isSyncingPending ? 'fa-spin' : ''} />
+                          {isSyncingPending ? 'SEDANG MENGIRIM ULANG...' : 'KIRIM ULANG KE DATABASE SEKARANG'}
+                        </button>
+                      </div>
+                    )}
                   </div>
 
                   <div className="flex flex-col md:flex-row items-center gap-6 mb-8 bg-white/50 p-6 rounded-3xl border border-white/60 shadow-inner">
