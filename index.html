@@ -146,6 +146,15 @@
             border: 1px solid rgba(255, 255, 255, 0.6);
             box-shadow: 0 4px 30px rgba(0, 0, 0, 0.05);
         }
+
+        /* Tipografi Bahasa Arab (RTL Presisi agar harakat & tanda baca tidak terbalik) */
+        .arabic-text {
+            font-family: 'Traditional Arabic', 'Amiri', 'Scheherazade New', 'Tahoma', 'Arial', sans-serif;
+            direction: rtl;
+            unicode-bidi: isolate;
+            text-align: right;
+            line-height: 2.1 !important;
+        }
     </style>
 </head>
 <body class="antialiased selection:bg-yellow-400 selection:text-gray-900">
@@ -218,6 +227,30 @@
             }
             return rawStr.toLowerCase() === String(filterVal).toLowerCase();
         };
+
+        // Helper Deteksi Teks Bahasa Arab & Konversi Angka/Huruf Pilihan Arab
+        const isArabicText = (text) => {
+            if (!text) return false;
+            return /[\u0600-\u06FF\u0750-\u077F\u08A0-\u08FF]/.test(String(text));
+        };
+
+        const normalizeArabicDigits = (str) => {
+            if (!str) return '';
+            return String(str)
+                .replace(/[\u0660-\u0669]/g, d => String(d.charCodeAt(0) - 0x0660))
+                .replace(/[\u06F0-\u06F9]/g, d => String(d.charCodeAt(0) - 0x06F0));
+        };
+
+        const mapOptionLetter = (ch) => {
+            const c = String(ch || '').trim().toUpperCase();
+            if (['A', 'أ', 'ا', 'إ', 'آ'].includes(c)) return 'A';
+            if (['B', 'ب'].includes(c)) return 'B';
+            if (['C', 'ج'].includes(c)) return 'C';
+            if (['D', 'د'].includes(c)) return 'D';
+            return '';
+        };
+
+        const ARABIC_OPTION_LABELS = { A: 'أ', B: 'ب', C: 'ج', D: 'د' };
 
         // Error Boundary untuk Stabilitas Maksimal
         class ErrorBoundary extends React.Component {
@@ -402,6 +435,15 @@
           const [filterMapel, setFilterMapel] = useState('Semua');
           const [filterKelas, setFilterKelas] = useState('Semua');
           const [filterJenis, setFilterJenis] = useState('Semua');
+
+          // State Monitoring Soal Guru (Akun Kepsek)
+          const [adminSoalKelas, setAdminSoalKelas] = useState('1');
+          const [adminSoalType, setAdminSoalType] = useState('THB');
+          const [adminSoalFilterStatus, setAdminSoalFilterStatus] = useState('Semua');
+          const [adminSoalCache, setAdminSoalCache] = useState({}); // key: `${sub}_${kelas}_${type}` -> { status, count, questions }
+          const [isScanningSoal, setIsScanningSoal] = useState(false);
+          const [adminPreviewSoal, setAdminPreviewSoal] = useState(null); // { subject, kelas, examType, questions }
+          const [isLoadingPreviewSoal, setIsLoadingPreviewSoal] = useState(false);
 
           const [teacherTab, setTeacherTab] = useState('input');
           const [selectedSubject, setSelectedSubject] = useState('');
@@ -694,7 +736,7 @@
           useEffect(() => { setAdminSubMenu('view'); }, [adminTab]);
 
           useEffect(() => {
-            if (view === 'admin' && ((adminTab === 'guru' || adminTab === 'siswa') && adminSubMenu === 'view' || adminTab === 'nilai')) {
+            if (view === 'admin' && ((adminTab === 'guru' || adminTab === 'siswa') && adminSubMenu === 'view' || adminTab === 'nilai' || adminTab === 'soal')) {
                 fetchAdminData();
             } else if (view === 'live_monitor') {
                 fetchAdminData(); 
@@ -1337,29 +1379,228 @@
           };
 
           // --- TEACHER FUNCTIONS ---
+          // Ekstraktor Soal Cerdas: Mendukung Bahasa Indonesia, Inggris, dan Bahasa Arab (1-, ١-, أ/ب/ج/د, spasi/tab berlebih)
           const handleParseExam = () => {
-            const lines = rawText.split('\n'); let currentQ = null; let parsed = [];
-            for (let i = 0; i < lines.length; i++) {
-              const line = lines[i].trim(); if (!line) continue;
-              const questionMatch = line.match(/^(?:soal\s*:|(\d+[\.\)]))\s*(.*)/i);
-              const optionMatch = line.match(/^([A-D])\s*[\.\)]\s*(.*)/i);
-              const keyMatch = line.match(/^kunci\s*:\s*([A-D])/i);
+            const lines = rawText.split(/\r?\n/);
+            let currentQ = null;
+            let lastOptionKey = null;
+            let parsed = [];
 
+            for (let i = 0; i < lines.length; i++) {
+              // Bersihkan karakter kontrol arah tak terlihat (LRM/RLM/BOM) & spasi/tab di ujung
+              const cleanLine = lines[i].replace(/[\u200E\u200F\u202A-\u202E\u2066-\u2069\uFEFF]/g, '').trim();
+              if (!cleanLine) continue;
+
+              const normalizedLine = normalizeArabicDigits(cleanLine);
+
+              // 1. Cek Baris Kunci Jawaban (fleksibel terhadap spasi, titik dua, sama dengan, strip, maupun huruf Arab)
+              const keyMatch = normalizedLine.match(/^(?:kunci(?:\s*jawaban)?|jawaban|key|الإجابة|الجواب)\s*[:=\-\.]?\s*([A-Da-dأاإآبجد])(?:\s*[\.\)\-:]?\s*.*)?$/iu);
+              if (keyMatch && currentQ) {
+                const mappedKey = mapOptionLetter(keyMatch[1]);
+                if (mappedKey) currentQ.answer = mappedKey;
+                lastOptionKey = null;
+                continue;
+              }
+
+              // 2. Cek Baris Pilihan Ganda (A-D atau أ/ا/ب/ج/د diikuti titik, kurung, strip, atau titik dua + spasi/tab)
+              const optionMatch = cleanLine.match(/^([A-Da-dأاإآبجد])\s*[\.\)\-:]\s*(.*)$/u);
+              if (optionMatch && currentQ) {
+                const mappedOpt = mapOptionLetter(optionMatch[1]);
+                if (mappedOpt) {
+                  let optContent = (optionMatch[2] || '').replace(/\t+/g, ' ').trim();
+                  // Jika kunci terselip di ujung baris opsi terakhir, ekstrak sekalian
+                  const inlineKeyMatch = optContent.match(/\s+(?:kunci(?:\s*jawaban)?|jawaban)\s*[:=\-]?\s*([A-Da-dأاإآبجد])$/iu);
+                  if (inlineKeyMatch) {
+                    const inlineKey = mapOptionLetter(inlineKeyMatch[1]);
+                    if (inlineKey) currentQ.answer = inlineKey;
+                    optContent = optContent.replace(inlineKeyMatch[0], '').trim();
+                  }
+                  currentQ.options[mappedOpt] = optContent;
+                  lastOptionKey = mappedOpt;
+                  continue;
+                }
+              }
+
+              // 3. Cek Baris Nomor Soal (mendukung 1., 1), 1-, 1:, ١-, Soal:, No. 1)
+              const questionMatch = normalizedLine.match(/^(?:soal\s*[:\.\-]?\s*|(?:no\.?\s*)?\d+\s*[\.\)\-:])\s*(.*)$/i);
               if (questionMatch) {
                 if (currentQ) parsed.push(currentQ);
-                const qText = questionMatch[2] || line.replace(/^(?:soal\s*:|(\d+[\.\)]))\s*/i, '');
-                currentQ = { id: Date.now() + i, text: qText.trim(), options: {}, answer: '', image: '' }; 
-              } else if (optionMatch && currentQ) {
-                currentQ.options[optionMatch[1].toUpperCase()] = optionMatch[2].trim();
-              } else if (keyMatch && currentQ) {
-                currentQ.answer = keyMatch[1].toUpperCase();
-              } else if (currentQ && Object.keys(currentQ.options).length === 0) {
-                currentQ.text += '\n' + line;
+                const qText = (questionMatch[1] || '').replace(/\t+/g, ' ').trim();
+                currentQ = { id: Date.now() + i, text: qText, options: {}, answer: '', image: '' };
+                lastOptionKey = null;
+                continue;
+              }
+
+              // 4. Baris lanjutan (untuk soal atau opsi yang terdiri dari beberapa baris)
+              if (currentQ) {
+                const cleanedCont = cleanLine.replace(/\t+/g, ' ').trim();
+                if (lastOptionKey && currentQ.options[lastOptionKey] !== undefined) {
+                  currentQ.options[lastOptionKey] += '\n' + cleanedCont;
+                } else if (Object.keys(currentQ.options).length === 0) {
+                  currentQ.text = currentQ.text ? `${currentQ.text}\n${cleanedCont}` : cleanedCont;
+                }
               }
             }
+
             if (currentQ) parsed.push(currentQ);
-            setParsedPreview(parsed); setFeedbackMsg(`Mendeteksi ${parsed.length} soal.`);
-            setTimeout(() => setFeedbackMsg(''), 3000);
+            const missingKeyCount = parsed.filter(q => !q.answer).length;
+            setParsedPreview(parsed);
+            if (parsed.length === 0) {
+              setFeedbackMsg('Tidak ada soal terdeteksi. Pastikan format nomor soal (1. / 1-), opsi (A-D / أ-د), dan Kunci: sudah sesuai.');
+            } else if (missingKeyCount > 0) {
+              setFeedbackMsg(`Mendeteksi ${parsed.length} soal (${missingKeyCount} soal belum memiliki Kunci Jawaban).`);
+            } else {
+              setFeedbackMsg(`Berhasil mendeteksi ${parsed.length} soal dengan kunci jawaban lengkap!`);
+            }
+            setTimeout(() => setFeedbackMsg(''), 5000);
+          };
+
+          // --- KEPSEK MONITORING SOAL FUNCTIONS ---
+          const checkSheetExistsLocally = (subject, kelas, examType) => {
+            if (!Array.isArray(systemExamSheets) || systemExamSheets.length === 0) return false;
+            const normSub = String(subject || '').toLowerCase().trim();
+            const normKelas = String(kelas || '').trim();
+            const normType = String(examType || 'THB').toLowerCase();
+
+            return systemExamSheets.some(sheet => {
+              const sName = String(typeof sheet === 'object' ? (sheet.name || sheet.sheetName || '') : sheet).toLowerCase();
+              const hasSub = sName.includes(normSub);
+              const hasKelas = new RegExp(`(^|[^0-9])${normKelas}([^0-9]|$)`).test(sName);
+              const isSheetUAS = sName.includes('uas');
+              const typeMatch = normType === 'uas' ? isSheetUAS : !isSheetUAS;
+              return hasSub && hasKelas && typeMatch;
+            });
+          };
+
+          const handleScanAdminSoal = async (targetKelas = adminSoalKelas, targetType = adminSoalType) => {
+            if (isScanningSoal || schoolProfile.subjects.length === 0) return;
+            setIsScanningSoal(true);
+            const newCache = { ...adminSoalCache };
+
+            for (const sub of schoolProfile.subjects) {
+              const cacheKey = `${sub}_${targetKelas}_${targetType}`;
+              try {
+                const res = await apiCall({ action: 'get_exam', subject: sub, kelas: targetKelas, examType: targetType });
+                const qs = Array.isArray(res.questions) ? res.questions : [];
+                newCache[cacheKey] = {
+                  status: qs.length > 0 ? 'ready' : 'empty',
+                  count: qs.length,
+                  missingKey: qs.filter(q => !q.answer).length,
+                  questions: qs
+                };
+              } catch (e) {
+                newCache[cacheKey] = { status: 'empty', count: 0, missingKey: 0, questions: [] };
+              }
+              setAdminSoalCache({ ...newCache });
+            }
+            setIsScanningSoal(false);
+            showToast(`Pengecekan status soal Kelas ${targetKelas} (${targetType}) selesai!`, 'success');
+          };
+
+          const handleOpenAdminPreviewSoal = async (subject, kelas = adminSoalKelas, examType = adminSoalType) => {
+            const cacheKey = `${subject}_${kelas}_${examType}`;
+            setIsLoadingPreviewSoal(true);
+            setAdminPreviewSoal({ subject, kelas, examType, questions: [] });
+            try {
+              const res = await apiCall({ action: 'get_exam', subject, kelas, examType });
+              const qs = Array.isArray(res.questions) ? res.questions : [];
+              setAdminSoalCache(prev => ({
+                ...prev,
+                [cacheKey]: {
+                  status: qs.length > 0 ? 'ready' : 'empty',
+                  count: qs.length,
+                  missingKey: qs.filter(q => !q.answer).length,
+                  questions: qs
+                }
+              }));
+              setAdminPreviewSoal({ subject, kelas, examType, questions: qs });
+            } catch (e) {
+              setAdminSoalCache(prev => ({
+                ...prev,
+                [cacheKey]: { status: 'empty', count: 0, missingKey: 0, questions: [] }
+              }));
+              setAdminPreviewSoal({ subject, kelas, examType, questions: [] });
+            } finally {
+              setIsLoadingPreviewSoal(false);
+            }
+          };
+
+          const printAdminSoalPreview = (previewData) => {
+            if (!previewData || !previewData.questions || previewData.questions.length === 0) {
+              return showToast('Tidak ada soal untuk dicetak.', 'warning');
+            }
+            const qHtml = previewData.questions.map((q, idx) => {
+              const qArabic = isArabicText(q.text);
+              const optsHtml = ['A', 'B', 'C', 'D'].map(opt => {
+                const optVal = q.options?.[opt] || '-';
+                const optArabic = isArabicText(optVal);
+                const isKey = q.answer === opt;
+                return `
+                  <div class="opt ${isKey ? 'opt-key' : ''} ${optArabic ? 'rtl-row' : ''}">
+                    <span class="opt-badge">${optArabic ? `${ARABIC_OPTION_LABELS[opt]} (${opt})` : opt}</span>
+                    <span class="opt-text ${optArabic ? 'arabic' : ''}" ${optArabic ? 'dir="rtl"' : ''}>${optVal}</span>
+                  </div>
+                `;
+              }).join('');
+              return `
+                <div class="q-card">
+                  <div class="q-header ${qArabic ? 'rtl-row' : ''}">
+                    <span class="q-num">${idx + 1}.</span>
+                    <div class="q-text ${qArabic ? 'arabic' : ''}" ${qArabic ? 'dir="rtl"' : ''}>${String(q.text || '').replace(/\n/g, '<br/>')}</div>
+                  </div>
+                  ${q.image ? `<div class="q-img"><img src="${getCleanLogoUrl(q.image)}" onerror="this.style.display='none'" /></div>` : ''}
+                  <div class="opt-grid">${optsHtml}</div>
+                  <div class="q-footer">Kunci Jawaban: <b>${q.answer || 'BELUM DIATUR'}</b></div>
+                </div>
+              `;
+            }).join('');
+
+            const htmlDoc = `
+              <!DOCTYPE html>
+              <html lang="id">
+              <head>
+                <meta charset="UTF-8">
+                <title>Naskah Soal ${previewData.subject} - Kelas ${previewData.kelas}</title>
+                <style>
+                  body { font-family: Arial, sans-serif; color: #111827; padding: 20px; background: #fff; }
+                  @page { size: A4; margin: 12mm; }
+                  .doc-head { text-align: center; border-bottom: 2px solid #111827; padding-bottom: 12px; margin-bottom: 20px; }
+                  .doc-head h2 { margin: 0 0 4px 0; font-size: 18px; text-transform: uppercase; }
+                  .doc-head p { margin: 2px 0; font-size: 13px; color: #374151; }
+                  .q-card { border: 1px solid #d1d5db; border-radius: 10px; padding: 14px; margin-bottom: 14px; page-break-inside: avoid; }
+                  .q-header { display: flex; gap: 8px; align-items: flex-start; margin-bottom: 10px; }
+                  .rtl-row { flex-direction: row-reverse; }
+                  .q-num { font-weight: bold; font-size: 14px; }
+                  .q-text { flex: 1; font-size: 14px; line-height: 1.6; }
+                  .arabic { font-family: 'Traditional Arabic', 'Tahoma', sans-serif; font-size: 19px; line-height: 2; text-align: right; direction: rtl; }
+                  .q-img { text-align: center; margin: 10px 0; }
+                  .q-img img { max-height: 180px; border-radius: 6px; border: 1px solid #e5e7eb; }
+                  .opt-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; }
+                  .opt { display: flex; align-items: center; gap: 8px; border: 1px solid #e5e7eb; padding: 6px 10px; border-radius: 6px; font-size: 13px; }
+                  .opt-key { background: #dcfce7; border-color: #16a34a; font-weight: bold; }
+                  .opt-badge { font-weight: bold; font-size: 12px; background: #f3f4f6; padding: 2px 7px; border-radius: 4px; }
+                  .opt-key .opt-badge { background: #16a34a; color: #fff; }
+                  .opt-text { flex: 1; }
+                  .q-footer { margin-top: 8px; font-size: 11px; color: #4b5563; border-top: 1px dashed #e5e7eb; padding-top: 6px; }
+                  @media print {
+                    body { padding: 0; }
+                    .opt-key, .opt-badge { -webkit-print-color-adjust: exact; print-color-adjust: exact; }
+                  }
+                </style>
+              </head>
+              <body onload="setTimeout(function(){ window.print(); }, 600)">
+                <div class="doc-head">
+                  <h2>ARSIP & MONITORING NASKAH SOAL (${previewData.examType})</h2>
+                  <p><b>${schoolProfile.namaSekolah}</b></p>
+                  <p>Mata Pelajaran: <b>${previewData.subject}</b> | Kelas: <b>${previewData.kelas}</b> | Total Soal: <b>${previewData.questions.length}</b></p>
+                </div>
+                ${qHtml}
+              </body>
+              </html>
+            `;
+            const w = window.open('', '_blank');
+            if (w) { w.document.open(); w.document.write(htmlDoc); w.document.close(); }
+            else { showToast('Matikan Pop-up Blocker agar tab cetak naskah soal bisa terbuka.', 'error'); }
           };
 
           const updateQuestionImage = (index, imageUrl) => {
@@ -1817,6 +2058,7 @@
               {id: 'profil', icon: 'school', label: 'Profil & Mapel', color: 'text-blue-600', border: 'border-blue-300'},
               {id: 'guru', icon: 'users', label: 'Data Guru', color: 'text-green-600', border: 'border-green-300'},
               {id: 'siswa', icon: 'user-graduate', label: 'Data Siswa', color: 'text-yellow-600', border: 'border-yellow-400'},
+              {id: 'soal', icon: 'clipboard-check', label: 'Pantau Soal Guru', color: 'text-emerald-600', border: 'border-emerald-300'},
               {id: 'jadwal', icon: 'clock', label: 'Jadwal & Status', color: 'text-purple-600', border: 'border-purple-300'},
               {id: 'nilai', icon: 'file-lines', label: 'Hasil Nilai', color: 'text-yellow-600', border: 'border-yellow-400'},
               {id: 'reset', icon: 'trash-can', label: 'Reset Data', color: 'text-red-600', border: 'border-red-300'}
@@ -2123,6 +2365,297 @@
                           </button>
                         </div>
                       )}
+
+                      {/* MENU KEPSEK: PANTAU & CEK KESIAPAN SOAL GURU */}
+                      {adminTab === 'soal' && (
+                        (() => {
+                          const mapelStatusList = schoolProfile.subjects.map(sub => {
+                            const cacheKey = `${sub}_${adminSoalKelas}_${adminSoalType}`;
+                            const cached = adminSoalCache[cacheKey];
+                            const sheetExists = checkSheetExistsLocally(sub, adminSoalKelas, adminSoalType);
+                            const isReady = cached ? cached.status === 'ready' : sheetExists;
+                            const count = cached ? cached.count : null;
+                            const missingKey = cached ? cached.missingKey : 0;
+                            return { sub, isReady, count, missingKey, scanned: !!cached };
+                          });
+
+                          const readyCount = mapelStatusList.filter(m => m.isReady).length;
+                          const notReadyCount = mapelStatusList.length - readyCount;
+
+                          const filteredMapelList = mapelStatusList.filter(m => {
+                            if (adminSoalFilterStatus === 'Siap') return m.isReady;
+                            if (adminSoalFilterStatus === 'Belum') return !m.isReady;
+                            return true;
+                          });
+
+                          return (
+                            <div className="space-y-6">
+                              {/* MODAL PRATINJAU FORMAT SOAL RAPI UNTUK KEPSEK */}
+                              {adminPreviewSoal && (
+                                <div className="fixed inset-0 z-[90] bg-gray-900/70 backdrop-blur-md flex items-center justify-center p-3 md:p-6">
+                                  <div className="bg-white rounded-3xl w-full max-w-4xl max-h-[90vh] flex flex-col shadow-2xl overflow-hidden border border-emerald-200">
+                                    <div className="p-4 md:p-6 border-b border-gray-200 bg-gradient-to-r from-emerald-50 to-yellow-50 flex flex-col sm:flex-row justify-between items-start sm:items-center gap-3">
+                                      <div>
+                                        <h3 className="text-lg md:text-2xl font-black text-gray-800 flex items-center gap-2">
+                                          <Icon name="file-circle-check" className="text-emerald-600" />
+                                          {adminPreviewSoal.subject}
+                                        </h3>
+                                        <p className="text-xs md:text-sm text-gray-600 font-bold mt-1">
+                                          Kelas {adminPreviewSoal.kelas} • Mode {adminPreviewSoal.examType} • Total: <span className="text-emerald-700">{adminPreviewSoal.questions.length} Soal</span>
+                                        </p>
+                                      </div>
+                                      <div className="flex items-center gap-2 w-full sm:w-auto">
+                                        {adminPreviewSoal.questions.length > 0 && (
+                                          <button onClick={() => printAdminSoalPreview(adminPreviewSoal)} className="flex-1 sm:flex-none px-4 py-2 bg-blue-600 hover:bg-blue-700 text-white font-bold rounded-xl text-xs md:text-sm shadow-sm flex items-center justify-center gap-2">
+                                            <Icon name="print" /> Cetak Soal
+                                          </button>
+                                        )}
+                                        <button onClick={() => setAdminPreviewSoal(null)} className="px-4 py-2 bg-gray-200 hover:bg-red-100 hover:text-red-700 text-gray-700 font-bold rounded-xl text-xs md:text-sm transition-colors">
+                                          <Icon name="xmark" /> Tutup
+                                        </button>
+                                      </div>
+                                    </div>
+
+                                    <div className="flex-1 overflow-y-auto p-4 md:p-6 bg-gray-50 space-y-5 custom-scrollbar">
+                                      {isLoadingPreviewSoal ? (
+                                        <div className="py-20 text-center text-gray-600 font-bold">
+                                          <Icon name="spinner" className="fa-spin text-4xl text-emerald-600 mb-3" />
+                                          <p>Mengambil naskah soal dari database...</p>
+                                        </div>
+                                      ) : adminPreviewSoal.questions.length === 0 ? (
+                                        <div className="py-16 text-center bg-white rounded-2xl border border-dashed border-red-300 p-6">
+                                          <Icon name="folder-open" className="text-5xl text-red-400 mb-3" />
+                                          <h4 className="text-lg font-black text-red-700 mb-1">Soal Belum Tersedia</h4>
+                                          <p className="text-sm text-gray-600">Guru pengampu belum mengunggah soal untuk <b>{adminPreviewSoal.subject} Kelas {adminPreviewSoal.kelas} ({adminPreviewSoal.examType})</b>.</p>
+                                        </div>
+                                      ) : (
+                                        adminPreviewSoal.questions.map((q, idx) => {
+                                          const qIsArabic = isArabicText(q.text);
+                                          return (
+                                            <div key={idx} className="bg-white p-5 rounded-2xl border border-gray-200 shadow-sm">
+                                              <div className="flex items-center justify-between mb-3 pb-2 border-b border-gray-100">
+                                                <span className="text-xs font-black px-3 py-1 rounded-full bg-emerald-100 text-emerald-800 border border-emerald-200">
+                                                  SOAL NO. {idx + 1}
+                                                </span>
+                                                {q.answer ? (
+                                                  <span className="text-xs font-black px-3 py-1 rounded-full bg-green-100 text-green-800 border border-green-300">
+                                                    <Icon name="key" className="mr-1" /> Kunci: {q.answer} {qIsArabic ? `(${ARABIC_OPTION_LABELS[q.answer] || ''})` : ''}
+                                                  </span>
+                                                ) : (
+                                                  <span className="text-xs font-black px-3 py-1 rounded-full bg-red-100 text-red-700 border border-red-300 animate-pulse">
+                                                    <Icon name="triangle-exclamation" className="mr-1" /> Kunci Belum Diatur!
+                                                  </span>
+                                                )}
+                                              </div>
+
+                                              {q.image && (
+                                                <div className="mb-4 text-center bg-gray-50 p-2 rounded-xl border border-gray-200">
+                                                  <img src={getCleanLogoUrl(q.image)} alt="Gambar Soal" className="max-h-56 mx-auto object-contain rounded-lg" onError={(e) => e.target.style.display='none'} />
+                                                </div>
+                                              )}
+
+                                              <p dir={qIsArabic ? 'rtl' : 'ltr'} className={`text-gray-900 mb-4 whitespace-pre-wrap break-words ${qIsArabic ? 'arabic-text text-xl md:text-2xl font-medium' : 'text-sm md:text-base font-medium leading-relaxed'}`}>
+                                                {q.text}
+                                              </p>
+
+                                              <div className="grid grid-cols-1 md:grid-cols-2 gap-2.5">
+                                                {['A', 'B', 'C', 'D'].map(opt => {
+                                                  const optVal = q.options?.[opt] || '-';
+                                                  const optIsArabic = isArabicText(optVal);
+                                                  const isCorrect = q.answer === opt;
+                                                  return (
+                                                    <div key={opt} className={`p-3 rounded-xl border-2 flex items-center gap-3 ${optIsArabic ? 'flex-row-reverse' : ''} ${isCorrect ? 'bg-green-50 border-green-500 text-green-900 font-bold' : 'bg-gray-50/70 border-gray-200 text-gray-800'}`}>
+                                                      <span className={`min-w-[2.2rem] h-8 px-1.5 rounded-lg shrink-0 flex items-center justify-center font-black text-xs ${isCorrect ? 'bg-green-600 text-white' : 'bg-gray-200 text-gray-700'}`}>
+                                                        {optIsArabic ? `${ARABIC_OPTION_LABELS[opt]}·${opt}` : opt}
+                                                      </span>
+                                                      <span dir={optIsArabic ? 'rtl' : 'ltr'} className={`flex-1 break-words ${optIsArabic ? 'arabic-text text-lg' : 'text-sm'}`}>
+                                                        {optVal}
+                                                      </span>
+                                                    </div>
+                                                  );
+                                                })}
+                                              </div>
+                                            </div>
+                                          );
+                                        })
+                                      )}
+                                    </div>
+                                  </div>
+                                </div>
+                              )}
+
+                              {/* HEADER & FILTER PANTAU SOAL KEPSEK */}
+                              <div className="glass-card rounded-2xl p-4 md:p-6">
+                                <div className="flex flex-col lg:flex-row justify-between items-start lg:items-center gap-4 border-b border-gray-200 pb-5 mb-5">
+                                  <div>
+                                    <h3 className="text-lg md:text-2xl font-black text-gray-800 flex items-center gap-2">
+                                      <Icon name="clipboard-check" className="text-emerald-600" /> Monitoring Kesiapan Soal Guru
+                                    </h3>
+                                    <p className="text-xs md:text-sm text-gray-600 mt-1">Pantau mata pelajaran yang sudah siap atau belum dibuat soalnya, serta periksa format naskah soal guru secara rapi.</p>
+                                  </div>
+                                  <div className="flex flex-wrap items-center gap-2 w-full lg:w-auto">
+                                    <select value={adminSoalKelas} onChange={e => setAdminSoalKelas(e.target.value)} className="bg-white border border-gray-300 rounded-xl px-3 py-2.5 text-sm font-bold text-gray-800 outline-none shadow-sm flex-1 sm:flex-none">
+                                      {ALL_CLASSES.map(k => <option key={k} value={k}>Kelas {k}</option>)}
+                                    </select>
+                                    <select value={adminSoalType} onChange={e => setAdminSoalType(e.target.value)} className="bg-white border border-gray-300 rounded-xl px-3 py-2.5 text-sm font-bold text-gray-800 outline-none shadow-sm flex-1 sm:flex-none">
+                                      <option value="THB">Reguler (THB)</option>
+                                      <option value="UAS">Akhir (UAS)</option>
+                                    </select>
+                                    <select value={adminSoalFilterStatus} onChange={e => setAdminSoalFilterStatus(e.target.value)} className="bg-white border border-gray-300 rounded-xl px-3 py-2.5 text-sm font-bold text-gray-800 outline-none shadow-sm flex-1 sm:flex-none">
+                                      <option value="Semua">Semua Status</option>
+                                      <option value="Siap">Sudah Siap</option>
+                                      <option value="Belum">Belum Siap</option>
+                                    </select>
+                                    <button onClick={() => handleScanAdminSoal(adminSoalKelas, adminSoalType)} disabled={isScanningSoal} className="w-full sm:w-auto px-5 py-2.5 bg-gradient-to-r from-emerald-600 to-green-600 hover:from-emerald-700 hover:to-green-700 text-white font-black rounded-xl text-sm shadow-md flex items-center justify-center gap-2 transition-all">
+                                      <Icon name={isScanningSoal ? 'spinner' : 'magnifying-glass-chart'} className={isScanningSoal ? 'fa-spin' : ''} />
+                                      {isScanningSoal ? 'Mengecek Server...' : 'Scan Status Kelas Ini'}
+                                    </button>
+                                  </div>
+                                </div>
+
+                                {/* RINGKASAN STATISTIK */}
+                                <div className="grid grid-cols-2 md:grid-cols-4 gap-3 md:gap-4 mb-6">
+                                  <div className="bg-white/80 border border-gray-200 rounded-2xl p-4 shadow-sm">
+                                    <p className="text-[11px] font-bold uppercase text-gray-500">Total Mapel</p>
+                                    <p className="text-2xl md:text-3xl font-black text-gray-800 mt-1">{schoolProfile.subjects.length}</p>
+                                  </div>
+                                  <div className="bg-green-50/90 border border-green-300 rounded-2xl p-4 shadow-sm">
+                                    <p className="text-[11px] font-bold uppercase text-green-700">Soal Sudah Siap</p>
+                                    <p className="text-2xl md:text-3xl font-black text-green-700 mt-1">{readyCount}</p>
+                                  </div>
+                                  <div className="bg-red-50/90 border border-red-300 rounded-2xl p-4 shadow-sm">
+                                    <p className="text-[11px] font-bold uppercase text-red-700">Belum Siap / Kosong</p>
+                                    <p className="text-2xl md:text-3xl font-black text-red-600 mt-1">{notReadyCount}</p>
+                                  </div>
+                                  <div className="bg-blue-50/90 border border-blue-200 rounded-2xl p-4 shadow-sm">
+                                    <p className="text-[11px] font-bold uppercase text-blue-700">Total Guru Terdaftar</p>
+                                    <p className="text-2xl md:text-3xl font-black text-blue-700 mt-1">{savedAdminTeachers.length}</p>
+                                  </div>
+                                </div>
+
+                                {/* TABEL STATUS SOAL PER MATA PELAJARAN */}
+                                <div className="bg-white/70 rounded-2xl border border-gray-200 overflow-x-auto shadow-inner">
+                                  <table className="w-full text-left text-sm whitespace-nowrap">
+                                    <thead className="bg-white border-b border-gray-200 text-gray-700">
+                                      <tr>
+                                        <th className="p-4 font-black">No</th>
+                                        <th className="p-4 font-black">Mata Pelajaran</th>
+                                        <th className="p-4 font-black text-center">Target Kelas</th>
+                                        <th className="p-4 font-black text-center">Status Kesiapan</th>
+                                        <th className="p-4 font-black text-center">Jumlah Soal</th>
+                                        <th className="p-4 font-black text-right">Aksi Kepala Sekolah</th>
+                                      </tr>
+                                    </thead>
+                                    <tbody>
+                                      {filteredMapelList.map((item, idx) => (
+                                        <tr key={item.sub} className="border-b border-gray-200 hover:bg-white transition-colors">
+                                          <td className="p-4 font-bold text-gray-500">{idx + 1}</td>
+                                          <td className="p-4 font-black text-gray-800">{item.sub}</td>
+                                          <td className="p-4 text-center font-bold text-gray-600">Kelas {adminSoalKelas} ({adminSoalType})</td>
+                                          <td className="p-4 text-center">
+                                            {item.isReady ? (
+                                              <span className="inline-flex items-center gap-1.5 px-3 py-1 rounded-full text-xs font-black bg-green-100 text-green-800 border border-green-300">
+                                                <Icon name="circle-check" /> SUDAH SIAP
+                                              </span>
+                                            ) : (
+                                              <span className="inline-flex items-center gap-1.5 px-3 py-1 rounded-full text-xs font-black bg-red-100 text-red-700 border border-red-300">
+                                                <Icon name="clock" /> BELUM SIAP
+                                              </span>
+                                            )}
+                                            {item.missingKey > 0 && (
+                                              <span className="ml-2 inline-flex items-center gap-1 px-2.5 py-1 rounded-full text-[11px] font-bold bg-amber-100 text-amber-800 border border-amber-300">
+                                                <Icon name="triangle-exclamation" /> {item.missingKey} Tanpa Kunci
+                                              </span>
+                                            )}
+                                          </td>
+                                          <td className="p-4 text-center font-mono font-black text-gray-700">
+                                            {item.count !== null ? `${item.count} Soal` : (item.isReady ? 'Tersedia (Klik Cek)' : '0 Soal')}
+                                          </td>
+                                          <td className="p-4 text-right">
+                                            <button onClick={() => handleOpenAdminPreviewSoal(item.sub, adminSoalKelas, adminSoalType)} className={`px-4 py-2 rounded-xl font-bold text-xs shadow-sm transition-all inline-flex items-center gap-2 ${item.isReady ? 'bg-emerald-600 hover:bg-emerald-700 text-white' : 'bg-gray-200 hover:bg-gray-300 text-gray-700'}`}>
+                                              <Icon name="eye" /> {item.isReady ? 'Pantau & Cek Soal' : 'Periksa Server'}
+                                            </button>
+                                          </td>
+                                        </tr>
+                                      ))}
+                                      {filteredMapelList.length === 0 && (
+                                        <tr>
+                                          <td colSpan="6" className="p-8 text-center text-gray-500 font-medium">Tidak ada mata pelajaran pada filter status ini.</td>
+                                        </tr>
+                                      )}
+                                    </tbody>
+                                  </table>
+                                </div>
+                              </div>
+
+                              {/* TABEL PANTAUAN GURU & WALI KELAS */}
+                              <div className="glass-card rounded-2xl p-4 md:p-6">
+                                <h4 className="text-base md:text-lg font-black text-gray-800 mb-3 flex items-center gap-2">
+                                  <Icon name="chalkboard-user" className="text-green-600" /> Pantauan Guru & Kesiapan Kelas Binaan
+                                </h4>
+                                <p className="text-xs text-gray-600 mb-4">Melihat daftar guru terdaftar beserta ringkasan berapa mata pelajaran yang sudah tersedia di kelas yang diampu.</p>
+                                <div className="bg-white/70 rounded-2xl border border-gray-200 overflow-x-auto shadow-inner max-h-80 custom-scrollbar">
+                                  {isAdminDataLoading ? (
+                                    <div className="p-8 text-center text-gray-500 font-bold"><Icon name="spinner" className="fa-spin mr-2 text-green-600" /> Memuat daftar guru...</div>
+                                  ) : savedAdminTeachers.length === 0 ? (
+                                    <div className="p-8 text-center text-gray-500 text-sm">Belum ada data guru yang diimpor.</div>
+                                  ) : (
+                                    <table className="w-full text-left text-sm whitespace-nowrap">
+                                      <thead className="sticky top-0 bg-white border-b border-gray-200 text-gray-700">
+                                        <tr>
+                                          <th className="p-3.5 font-black">Nama Guru</th>
+                                          <th className="p-3.5 font-black">Wali Kelas / Keterangan</th>
+                                          <th className="p-3.5 font-black text-center">Kesiapan Soal di Kelasnya</th>
+                                          <th className="p-3.5 font-black text-right">Cek Kelas</th>
+                                        </tr>
+                                      </thead>
+                                      <tbody>
+                                        {savedAdminTeachers.map((t, i) => {
+                                          const guruKelasNum = String(t.waliKelas || '').match(/\d+/)?.[0] || '';
+                                          const readyInGuruClass = guruKelasNum
+                                            ? schoolProfile.subjects.filter(s => {
+                                                const ck = `${s}_${guruKelasNum}_${adminSoalType}`;
+                                                return adminSoalCache[ck] ? adminSoalCache[ck].status === 'ready' : checkSheetExistsLocally(s, guruKelasNum, adminSoalType);
+                                              }).length
+                                            : 0;
+                                          return (
+                                            <tr key={i} className="border-b border-gray-200 hover:bg-white transition-colors">
+                                              <td className="p-3.5 font-bold text-gray-800">{t.nama}</td>
+                                              <td className="p-3.5 text-gray-600">{t.waliKelas || '-'} {t.ket ? `(${t.ket})` : ''}</td>
+                                              <td className="p-3.5 text-center">
+                                                {guruKelasNum ? (
+                                                  readyInGuruClass > 0 ? (
+                                                    <span className="px-3 py-1 rounded-full text-xs font-black bg-green-100 text-green-800 border border-green-300">
+                                                      {readyInGuruClass} / {schoolProfile.subjects.length} Mapel Siap
+                                                    </span>
+                                                  ) : (
+                                                    <span className="px-3 py-1 rounded-full text-xs font-black bg-red-100 text-red-700 border border-red-300">
+                                                      Belum Ada Soal (Kelas {guruKelasNum})
+                                                    </span>
+                                                  )
+                                                ) : (
+                                                  <span className="text-xs text-gray-400 font-medium">Guru Mapel / Umum</span>
+                                                )}
+                                              </td>
+                                              <td className="p-3.5 text-right">
+                                                {guruKelasNum && (
+                                                  <button onClick={() => { setAdminSoalKelas(guruKelasNum); handleScanAdminSoal(guruKelasNum, adminSoalType); }} className="px-3 py-1.5 bg-blue-100 hover:bg-blue-600 hover:text-white text-blue-700 font-bold rounded-lg text-xs transition-colors">
+                                                    Cek Kelas {guruKelasNum}
+                                                  </button>
+                                                )}
+                                              </td>
+                                            </tr>
+                                          );
+                                        })}
+                                      </tbody>
+                                    </table>
+                                  )}
+                                </div>
+                              </div>
+                            </div>
+                          );
+                        })()
+                      )}
                     </div>
                   )}
                 </div>
@@ -2191,8 +2724,8 @@
                           </div>
                         </div>
                         <div className="mb-4 md:mb-6">
-                          <label className="block text-gray-600 text-xs font-bold uppercase mb-2">Tempel Teks Soal</label>
-                          <textarea value={rawText || ''} onChange={(e) => setRawText(e.target.value)} placeholder="1. Apa yang dimaksud...&#10;A. Jawaban A&#10;B. Jawaban B&#10;C. Jawaban C&#10;D. Jawaban D&#10;Kunci: A" className="w-full h-48 md:h-72 bg-white/80 border border-gray-300 rounded-xl p-4 text-gray-800 font-mono text-base focus:border-green-500 outline-none resize-none shadow-inner"></textarea>
+                          <label className="block text-gray-600 text-xs font-bold uppercase mb-2">Tempel Teks Soal (Mendukung Bahasa Indonesia, Inggris & Arab)</label>
+                          <textarea value={rawText || ''} onChange={(e) => setRawText(e.target.value)} placeholder={"1. Apa yang dimaksud...\nA. Jawaban A\nB. Jawaban B\nC. Jawaban C\nD. Jawaban D\nKunci: A\n\nAtau format Bahasa Arab:\n1- أَنَا عَائِشَةُ...\nأ- اِمْرَأَةٌ\nب- بَنَاتٌ\nج- مُدَرِّسَةٌ\nد- وَلَدٌ\nKunci: C"} className="w-full h-48 md:h-72 bg-white/80 border border-gray-300 rounded-xl p-4 text-gray-800 font-mono text-base focus:border-green-500 outline-none resize-none shadow-inner"></textarea>
                         </div>
                         <button onClick={handleParseExam} className="w-full bg-gray-800 hover:bg-gray-900 text-white font-bold py-3 md:py-4 rounded-xl flex justify-center gap-2 text-sm md:text-base shadow-lg hover:scale-[1.02] transition-transform"><Icon name="chart-line" /> EKSTRAK STRUKTUR SOAL</button>
                         {feedbackMsg && <div className="mt-4 p-3 bg-green-100 text-green-800 border border-green-300 rounded-xl text-xs md:text-sm font-bold text-center shadow-sm">{feedbackMsg}</div>}
@@ -2205,7 +2738,9 @@
                           <span className="bg-yellow-200 text-yellow-800 px-4 py-1.5 rounded-full text-sm font-black shadow-sm border border-yellow-300">{parsedPreview.length} SOAL</span>
                         </h3>
                         <div className="flex-1 overflow-y-auto mb-4 pr-3 space-y-6 custom-scrollbar">
-                          {parsedPreview.map((q, idx) => (
+                          {parsedPreview.map((q, idx) => {
+                            const qIsArabic = isArabicText(q.text);
+                            return (
                             <div key={idx} className="bg-white/80 p-5 rounded-2xl border border-gray-200 shadow-sm">
                               <div className="mb-5 bg-gray-50/80 p-4 rounded-xl border border-gray-200 shadow-inner">
                                 <label className="text-xs text-blue-700 font-bold uppercase block mb-2"><Icon name="image"/> Link Gambar Soal (Copy Image Address / G-Drive / HTML)</label>
@@ -2216,17 +2751,28 @@
                                   </div>
                                 )}
                               </div>
-                              <p className="text-gray-900 text-base md:text-lg font-medium mb-4 whitespace-pre-wrap break-words leading-relaxed"><span className="text-green-600 font-black mr-2 text-xl">{idx + 1}.</span>{q.text}</p>
-                              <div className="grid grid-cols-1 md:grid-cols-2 gap-3 text-sm md:text-base text-gray-800 font-medium">
-                                {['A', 'B', 'C', 'D'].map(opt => (
-                                  <div key={opt} className={`p-3 rounded-xl border-2 flex items-center gap-3 ${q.answer === opt ? 'bg-green-100 border-green-500 text-green-900 font-bold shadow-sm' : 'border-gray-200 bg-white shadow-sm'}`}>
-                                     <span className={`w-8 h-8 rounded-lg shrink-0 flex justify-center items-center font-black text-sm ${q.answer === opt ? 'bg-green-600 text-white' : 'bg-gray-200 text-gray-700'}`}>{opt}</span> 
-                                     <span className="break-words flex-1">{q.options[opt] || '-'}</span>
-                                  </div>
-                                ))}
+                              <div className={`flex items-start gap-2 mb-4 ${qIsArabic ? 'flex-row-reverse' : ''}`}>
+                                <span className="text-green-600 font-black text-xl shrink-0">{idx + 1}.</span>
+                                <p dir={qIsArabic ? 'rtl' : 'ltr'} className={`text-gray-900 font-medium whitespace-pre-wrap break-words flex-1 ${qIsArabic ? 'arabic-text text-xl md:text-2xl' : 'text-base md:text-lg leading-relaxed'}`}>{q.text}</p>
                               </div>
+                              <div className="grid grid-cols-1 md:grid-cols-2 gap-3 text-sm md:text-base text-gray-800 font-medium">
+                                {['A', 'B', 'C', 'D'].map(opt => {
+                                  const optVal = q.options[opt] || '-';
+                                  const optIsArabic = isArabicText(optVal);
+                                  return (
+                                  <div key={opt} className={`p-3 rounded-xl border-2 flex items-center gap-3 ${optIsArabic ? 'flex-row-reverse' : ''} ${q.answer === opt ? 'bg-green-100 border-green-500 text-green-900 font-bold shadow-sm' : 'border-gray-200 bg-white shadow-sm'}`}>
+                                     <span className={`min-w-[2.2rem] h-8 px-1.5 rounded-lg shrink-0 flex justify-center items-center font-black text-xs ${q.answer === opt ? 'bg-green-600 text-white' : 'bg-gray-200 text-gray-700'}`}>{optIsArabic ? `${ARABIC_OPTION_LABELS[opt]}·${opt}` : opt}</span> 
+                                     <span dir={optIsArabic ? 'rtl' : 'ltr'} className={`break-words flex-1 ${optIsArabic ? 'arabic-text text-lg' : ''}`}>{optVal}</span>
+                                  </div>
+                                  );
+                                })}
+                              </div>
+                              {!q.answer && (
+                                <p className="mt-3 text-xs font-bold text-red-600 bg-red-50 border border-red-200 px-3 py-1.5 rounded-lg"><Icon name="triangle-exclamation" className="mr-1"/> Perhatian: Kunci jawaban soal ini belum terdeteksi.</p>
+                              )}
                             </div>
-                          ))}
+                            );
+                          })}
                         </div>
                         <button onClick={handleSaveExamToDatabase} disabled={parsedPreview.length === 0} className={`w-full py-4 font-black text-sm md:text-lg rounded-xl flex items-center justify-center gap-2 ${parsedPreview.length === 0 ? 'bg-gray-300 text-gray-500' : 'bg-gradient-to-r from-yellow-400 to-green-500 text-gray-900 shadow-lg hover:scale-[1.02] transition-transform'}`}><Icon name="upload" /> TERBITKAN KE SERVER</button>
                       </div>
@@ -2268,12 +2814,17 @@
                          ) : savedQuestions.length === 0 ? (
                             <div className="h-full flex flex-col items-center justify-center text-gray-500 font-medium"><Icon name="file-lines" className="text-6xl opacity-30 mb-4" /><p className="text-center">Pilih Kelas & Jenis Ujian lalu klik "Tampilkan".</p></div>
                          ) : (
-                            savedQuestions.map((q, idx) => (
+                            savedQuestions.map((q, idx) => {
+                              const qIsArabic = isArabicText(q.text);
+                              return (
                               <div key={idx} className="border border-gray-200 relative group bg-white/90 p-5 rounded-2xl shadow-sm hover:shadow-md transition-shadow">
                                 <button onClick={() => handleDeleteSingleQuestion(idx)} className="absolute top-4 right-4 p-2 text-gray-400 hover:text-white hover:bg-red-500 transition-colors bg-gray-100 rounded-lg border border-gray-200 shadow-sm" title="Hapus Soal Ini">
                                     <Icon name="trash"/>
                                 </button>
-                                <p className="text-gray-900 text-base md:text-lg font-medium mb-4 pr-12 whitespace-pre-wrap break-words leading-relaxed"><span className="text-green-600 font-bold mr-2 text-xl">{idx + 1}.</span>{q.text}</p>
+                                <div className={`flex items-start gap-2 mb-4 pr-12 ${qIsArabic ? 'flex-row-reverse' : ''}`}>
+                                  <span className="text-green-600 font-bold text-xl shrink-0">{idx + 1}.</span>
+                                  <p dir={qIsArabic ? 'rtl' : 'ltr'} className={`text-gray-900 font-medium whitespace-pre-wrap break-words flex-1 ${qIsArabic ? 'arabic-text text-xl md:text-2xl' : 'text-base md:text-lg leading-relaxed'}`}>{q.text}</p>
+                                </div>
                                 
                                 <div className="my-5 bg-gray-50/80 p-4 rounded-xl border border-gray-200 shadow-inner">
                                   <label className="text-xs text-blue-700 font-bold uppercase block mb-2"><Icon name="image"/> Link Gambar Soal (Copy Image Address / HTML)</label>
@@ -2291,15 +2842,20 @@
                                 </div>
 
                                 <div className="grid grid-cols-1 md:grid-cols-2 gap-3 text-sm md:text-base text-gray-800 font-medium">
-                                  {Object.keys(q.options || {}).map(opt => (
-                                    <div key={opt} className={`p-3 rounded-xl border-2 flex items-center gap-3 ${q.answer === opt ? 'bg-green-100 border-green-500 text-green-900 font-bold shadow-sm' : 'border-gray-200 bg-white shadow-sm'}`}>
-                                       <span className={`font-black w-8 h-8 flex justify-center items-center shrink-0 rounded-lg ${q.answer === opt ? 'bg-green-600 text-white' : 'bg-gray-200 text-gray-700'}`}>{opt}</span> 
-                                       <span className="break-words flex-1">{q.options[opt]}</span>
+                                  {Object.keys(q.options || {}).map(opt => {
+                                    const optVal = q.options[opt];
+                                    const optIsArabic = isArabicText(optVal);
+                                    return (
+                                    <div key={opt} className={`p-3 rounded-xl border-2 flex items-center gap-3 ${optIsArabic ? 'flex-row-reverse' : ''} ${q.answer === opt ? 'bg-green-100 border-green-500 text-green-900 font-bold shadow-sm' : 'border-gray-200 bg-white shadow-sm'}`}>
+                                       <span className={`font-black min-w-[2.2rem] h-8 px-1.5 flex justify-center items-center shrink-0 rounded-lg text-xs ${q.answer === opt ? 'bg-green-600 text-white' : 'bg-gray-200 text-gray-700'}`}>{optIsArabic ? `${ARABIC_OPTION_LABELS[opt]}·${opt}` : opt}</span> 
+                                       <span dir={optIsArabic ? 'rtl' : 'ltr'} className={`break-words flex-1 ${optIsArabic ? 'arabic-text text-lg' : ''}`}>{optVal}</span>
                                     </div>
-                                  ))}
+                                    );
+                                  })}
                                 </div>
                               </div>
-                            ))
+                              );
+                            })
                          )}
                        </div>
                     </div>
@@ -2472,28 +3028,37 @@
                             </div>
                         )}
 
-                        <h3 className="text-lg sm:text-xl md:text-3xl font-medium text-gray-900 leading-relaxed whitespace-pre-wrap break-words mb-8 drop-shadow-sm">
-                          {currentQ.text}
-                        </h3>
+                        {(() => {
+                          const qIsArabic = isArabicText(currentQ.text);
+                          return (
+                            <>
+                              <h3 dir={qIsArabic ? 'rtl' : 'ltr'} className={`font-medium text-gray-900 whitespace-pre-wrap break-words mb-8 drop-shadow-sm ${qIsArabic ? 'arabic-text text-2xl sm:text-3xl md:text-4xl' : 'text-lg sm:text-xl md:text-3xl leading-relaxed'}`}>
+                                {currentQ.text}
+                              </h3>
 
-                        <div className="space-y-4 md:space-y-5">
-                          {['A', 'B', 'C', 'D'].map(opt => {
-                             const isSelected = studentAnswers[currentQ._id] === opt;
-                             return (
-                               <button key={opt} onClick={() => {
-                                 setStudentAnswers(prev => {
-                                   const newAnswers = { ...prev, [currentQ._id]: opt };
-                                   const subjectJenis = examConfig[activeSubject]?.jenis || 'THB';
-                                   safeStorage.set(`exam_progress_${currentUser.nisn}_${activeSubject}_${subjectJenis}`, JSON.stringify(newAnswers));
-                                   return newAnswers;
-                                 });
-                               }} className={`w-full text-left p-4 sm:p-5 md:p-6 rounded-2xl border-2 flex items-center gap-4 md:gap-6 transition-all hover:scale-[1.01] ${isSelected ? 'border-yellow-400 bg-yellow-50/90 shadow-md' : 'border-gray-300 bg-white/70 hover:bg-white/90 hover:shadow-sm backdrop-blur-sm'}`}>
-                                 <div className={`w-10 h-10 md:w-14 md:h-14 shrink-0 rounded-xl flex items-center justify-center font-black text-base md:text-2xl shadow-sm ${isSelected ? 'bg-gradient-to-br from-yellow-400 to-green-500 text-white' : 'bg-gray-200 text-gray-700'}`}>{opt}</div>
-                                 <span className={`text-base md:text-xl flex-1 break-words font-medium ${isSelected ? 'text-green-900 font-bold' : 'text-gray-800'}`}>{currentQ.options?.[opt]}</span>
-                               </button>
-                             )
-                          })}
-                        </div>
+                              <div className="space-y-4 md:space-y-5">
+                                {['A', 'B', 'C', 'D'].map(opt => {
+                                   const isSelected = studentAnswers[currentQ._id] === opt;
+                                   const optVal = currentQ.options?.[opt];
+                                   const optIsArabic = isArabicText(optVal);
+                                   return (
+                                     <button key={opt} onClick={() => {
+                                       setStudentAnswers(prev => {
+                                         const newAnswers = { ...prev, [currentQ._id]: opt };
+                                         const subjectJenis = examConfig[activeSubject]?.jenis || 'THB';
+                                         safeStorage.set(`exam_progress_${currentUser.nisn}_${activeSubject}_${subjectJenis}`, JSON.stringify(newAnswers));
+                                         return newAnswers;
+                                       });
+                                     }} className={`w-full p-4 sm:p-5 md:p-6 rounded-2xl border-2 flex items-center gap-4 md:gap-6 transition-all hover:scale-[1.01] ${optIsArabic ? 'flex-row-reverse text-right' : 'text-left'} ${isSelected ? 'border-yellow-400 bg-yellow-50/90 shadow-md' : 'border-gray-300 bg-white/70 hover:bg-white/90 hover:shadow-sm backdrop-blur-sm'}`}>
+                                       <div className={`min-w-[2.75rem] h-10 md:min-w-[3.5rem] md:h-14 px-2 shrink-0 rounded-xl flex items-center justify-center font-black text-base md:text-xl shadow-sm ${isSelected ? 'bg-gradient-to-br from-yellow-400 to-green-500 text-white' : 'bg-gray-200 text-gray-700'}`}>{optIsArabic ? ARABIC_OPTION_LABELS[opt] : opt}</div>
+                                       <span dir={optIsArabic ? 'rtl' : 'ltr'} className={`flex-1 break-words font-medium ${optIsArabic ? 'arabic-text text-xl md:text-2xl' : 'text-base md:text-xl'} ${isSelected ? 'text-green-900 font-bold' : 'text-gray-800'}`}>{optVal}</span>
+                                     </button>
+                                   )
+                                })}
+                              </div>
+                            </>
+                          );
+                        })()}
                       </div>
                     </div>
 
@@ -2662,6 +3227,7 @@
                               {examResultDetails?.questions.map((q, idx) => {
                                   const studentAns = examResultDetails.answers[q._id];
                                   const isCorrect = studentAns === q.answer;
+                                  const qIsArabic = isArabicText(q.text);
 
                                   return (
                                       <div key={idx} className={`bg-white p-5 md:p-8 rounded-2xl border-l-8 shadow-md relative overflow-hidden ${isCorrect ? 'border-green-500' : 'border-red-500'}`}>
@@ -2669,7 +3235,10 @@
                                               {isCorrect ? <><Icon name="check"/> BENAR</> : <><Icon name="xmark"/> SALAH</>}
                                           </div>
 
-                                          <p className="text-gray-900 text-base md:text-lg font-medium mb-6 pr-20 whitespace-pre-wrap break-words leading-relaxed mt-2"><span className="font-black text-gray-500 mr-2">{idx + 1}.</span> {q.text}</p>
+                                          <div className={`flex items-start gap-2 mb-6 pr-20 mt-2 ${qIsArabic ? 'flex-row-reverse' : ''}`}>
+                                            <span className="font-black text-gray-500 shrink-0">{idx + 1}.</span>
+                                            <p dir={qIsArabic ? 'rtl' : 'ltr'} className={`text-gray-900 font-medium whitespace-pre-wrap break-words flex-1 ${qIsArabic ? 'arabic-text text-xl md:text-2xl' : 'text-base md:text-lg leading-relaxed'}`}>{q.text}</p>
+                                          </div>
                                           
                                           {q.image && (
                                               <div className="mb-6 rounded-xl overflow-hidden border border-gray-200 inline-block p-2 shadow-sm bg-gray-50">
@@ -2681,24 +3250,26 @@
                                               {['A', 'B', 'C', 'D'].map(opt => {
                                                   const isStudentChoice = studentAns === opt;
                                                   const isActualAnswer = q.answer === opt;
+                                                  const optVal = q.options?.[opt];
+                                                  const optIsArabic = isArabicText(optVal);
                                                   
                                                   let optClass = "border-gray-200 bg-gray-50 text-gray-700";
                                                   let iconHtml = null;
 
                                                   if (isActualAnswer) {
                                                       optClass = "border-green-500 bg-green-50 text-green-800 shadow-sm ring-1 ring-green-500 font-bold";
-                                                      iconHtml = <Icon name="check-circle" className="text-green-600 text-xl absolute right-4" />;
+                                                      iconHtml = <Icon name="check-circle" className={`text-green-600 text-xl absolute ${optIsArabic ? 'left-4' : 'right-4'}`} />;
                                                   } else if (isStudentChoice && !isActualAnswer) {
                                                       optClass = "border-red-500 bg-red-50 text-red-800 shadow-sm ring-1 ring-red-500 font-bold";
-                                                      iconHtml = <Icon name="circle-xmark" className="text-red-600 text-xl absolute right-4" />;
+                                                      iconHtml = <Icon name="circle-xmark" className={`text-red-600 text-xl absolute ${optIsArabic ? 'left-4' : 'right-4'}`} />;
                                                   }
 
                                                   return (
-                                                      <div key={opt} className={`relative p-3 md:p-4 rounded-xl border-2 flex items-center gap-4 transition-colors ${optClass}`}>
+                                                      <div key={opt} className={`relative p-3 md:p-4 rounded-xl border-2 flex items-center gap-4 transition-colors ${optIsArabic ? 'flex-row-reverse' : ''} ${optClass}`}>
                                                           <span className={`w-8 h-8 md:w-10 md:h-10 shrink-0 rounded-lg flex items-center justify-center font-black text-sm md:text-base ${isActualAnswer ? 'bg-green-500 text-white' : (isStudentChoice ? 'bg-red-500 text-white' : 'bg-white border border-gray-300 text-gray-500')}`}>
-                                                              {opt}
+                                                              {optIsArabic ? ARABIC_OPTION_LABELS[opt] : opt}
                                                           </span>
-                                                          <span className="text-sm md:text-base flex-1 break-words pr-8">{q.options?.[opt]}</span>
+                                                          <span dir={optIsArabic ? 'rtl' : 'ltr'} className={`flex-1 break-words ${optIsArabic ? 'arabic-text text-lg md:text-xl pl-8' : 'text-sm md:text-base pr-8'}`}>{optVal}</span>
                                                           {iconHtml}
                                                       </div>
                                                   )
